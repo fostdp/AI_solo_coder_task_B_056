@@ -28,6 +28,11 @@ class SharedSettings(BaseSettings):
     REDIS_STREAM_DELAMINATION: str = "stream:delamination_detected"
     REDIS_STREAM_GROUT_REQUEST: str = "stream:grout_request"
     REDIS_STREAM_GROUT_RESULTS: str = "stream:grout_results"
+    REDIS_STREAM_PRESSURE_FLOW_OPTIMIZE: str = "stream:pressure_flow_optimize"
+    REDIS_STREAM_BOND_STRENGTH_ASSESS: str = "stream:bond_strength_assess"
+    REDIS_STREAM_SHRINKAGE_PREDICT: str = "stream:shrinkage_predict"
+    REDIS_STREAM_PRIORITY_RANK: str = "stream:priority_rank"
+    REDIS_STREAM_FEATURE_RESULTS: str = "stream:feature_results"
 
     CONSUMER_GROUP: str = "mogao_workers"
     CONSUMER_NAME: str = "worker-01"

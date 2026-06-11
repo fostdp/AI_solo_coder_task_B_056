@@ -1,6 +1,65 @@
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass, field
+from enum import Enum
+
+
+class CrackRiskLevel(str, Enum):
+    NONE = "无"
+    LOW = "低"
+    MEDIUM = "中"
+    HIGH = "高"
+    CRITICAL = "极高"
+
+
+@dataclass
+class PressureFlowDataPoint:
+    pressure_kpa: float
+    flow_rate_mls: float
+    elapsed_seconds: float
+    temperature_c: Optional[float] = None
+    is_reliable: bool = True
+
+
+@dataclass
+class InjectionRateOptimizationResult:
+    optimal_pressure_kpa: float
+    optimal_flow_rate_mls: float
+    polynomial_degree: int
+    polynomial_coefficients: List[float]
+    r_squared: float
+    secondary_delamination_risk_pct: float
+    recommended_max_flow_mls: float
+    pressure_flow_curve: List[Dict]
+    warning_message: Optional[str] = None
+
+
+@dataclass
+class BondStrengthAssessmentResult:
+    surface_id: str
+    timestamp: str
+    baseline_damping_ratios: List[float]
+    current_damping_ratios: List[float]
+    bond_strength_degradation_pct: float
+    remaining_bond_strength_mpa: float
+    critical_mode_index: Optional[int]
+    assessment_confidence: float
+    risk_level: str
+    recommendations: List[str]
+
+
+@dataclass
+class DryingShrinkagePredictionResult:
+    grout_formulation: str
+    ambient_temperature_c: float
+    ambient_humidity_pct: float
+    predicted_shrinkage_strain: float
+    predicted_crack_width_mm: float
+    crack_risk_level: str
+    shrinkage_time_curve_days: List[float]
+    shrinkage_time_curve_strain: List[float]
+    critical_period_days: float
+    recommendations: List[str]
 
 
 @dataclass
@@ -297,3 +356,225 @@ def assess_reinforcement_effectiveness(
         "assessment_notes": notes,
         "per_mode_recovery_pct": [round(x, 4) for x in freq_recovery_pcts],
     }
+
+
+def generate_simulated_pressure_flow_data(
+    n_points: int = 30,
+    pressure_range_kpa: Tuple[float, float] = (50.0, 600.0),
+    viscosity_pa_s: float = 0.25,
+    noise_std_pct: float = 0.08,
+) -> List[PressureFlowDataPoint]:
+    points = []
+    pressures = np.linspace(pressure_range_kpa[0], pressure_range_kpa[1], n_points)
+    
+    for i, p in enumerate(pressures):
+        t_sec = i * 30.0 + np.random.uniform(0, 10.0)
+        
+        theoretical_flow = (1e-12 * p * 1000.0 * 2.0 * np.pi * 0.05 * 0.05) / (viscosity_pa_s * 0.05) * 1e6
+        
+        if p > 400:
+            theoretical_flow *= (1.0 + 0.0008 * (p - 400))
+        
+        noise = np.random.normal(0, noise_std_pct * theoretical_flow)
+        measured_flow = max(theoretical_flow + noise, 1.0)
+        
+        is_reliable = True
+        if np.random.rand() < 0.1:
+            measured_flow *= np.random.uniform(0.6, 0.8)
+            is_reliable = False
+        
+        temp_c = 18.0 + np.random.normal(0, 2.0)
+        
+        points.append(PressureFlowDataPoint(
+            pressure_kpa=float(p),
+            flow_rate_mls=float(measured_flow),
+            elapsed_seconds=float(t_sec),
+            temperature_c=float(temp_c),
+            is_reliable=is_reliable,
+        ))
+    
+    return points
+
+
+class PressureFlowPolynomialRegressor:
+    def __init__(
+        self,
+        max_degree: int = 5,
+        use_cross_validation: bool = True,
+        delamination_threshold_pressure_kpa: float = 450.0,
+        max_flow_rate_mls: float = 500.0,
+    ):
+        self.max_degree = max_degree
+        self.use_cross_validation = use_cross_validation
+        self.delamination_threshold_pressure_kpa = delamination_threshold_pressure_kpa
+        self.max_flow_rate_mls = max_flow_rate_mls
+        self.optimal_degree = None
+        self.coefficients = None
+        self.r_squared = 0.0
+
+    def _polynomial_features(self, x: np.ndarray, degree: int) -> np.ndarray:
+        return np.vander(x, degree + 1, increasing=True)
+
+    def _fit_ols(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+        return np.linalg.lstsq(X, y, rcond=None)[0]
+
+    def _compute_r_squared(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        return 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    def _cross_validation_score(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        degree: int,
+        n_folds: int = 5,
+    ) -> float:
+        n_samples = len(y)
+        indices = np.arange(n_samples)
+        np.random.shuffle(indices)
+        fold_size = n_samples // n_folds
+        
+        scores = []
+        for fold in range(n_folds):
+            val_start = fold * fold_size
+            val_end = val_start + fold_size if fold < n_folds - 1 else n_samples
+            
+            val_indices = indices[val_start:val_end]
+            train_indices = np.concatenate([indices[:val_start], indices[val_end:]])
+            
+            X_train, X_val = X[train_indices], X[val_indices]
+            y_train, y_val = y[train_indices], y[val_indices]
+            
+            coeffs = self._fit_ols(X_train, y_train)
+            y_pred = X_val @ coeffs
+            
+            scores.append(self._compute_r_squared(y_val, y_pred))
+        
+        return float(np.mean(scores))
+
+    def fit(
+        self,
+        data_points: List[PressureFlowDataPoint],
+    ) -> "PressureFlowPolynomialRegressor":
+        reliable_points = [p for p in data_points if p.is_reliable]
+        if len(reliable_points) < 10:
+            reliable_points = data_points
+        
+        pressures = np.array([p.pressure_kpa for p in reliable_points], dtype=np.float64)
+        flows = np.array([p.flow_rate_mls for p in reliable_points], dtype=np.float64)
+        
+        press_norm = pressures / 1000.0
+        
+        best_score = -np.inf
+        best_degree = 2
+        best_coeffs = None
+        
+        for degree in range(2, self.max_degree + 1):
+            X = self._polynomial_features(press_norm, degree)
+            
+            if self.use_cross_validation and len(reliable_points) >= 15:
+                score = self._cross_validation_score(X, flows, degree)
+            else:
+                coeffs = self._fit_ols(X, flows)
+                y_pred = X @ coeffs
+                score = self._compute_r_squared(flows, y_pred)
+            
+            if score > best_score:
+                best_score = score
+                best_degree = degree
+        
+        X_best = self._polynomial_features(press_norm, best_degree)
+        best_coeffs = self._fit_ols(X_best, flows)
+        y_pred = X_best @ best_coeffs
+        self.r_squared = self._compute_r_squared(flows, y_pred)
+        
+        self.optimal_degree = best_degree
+        self.coefficients = best_coeffs
+        
+        return self
+
+    def predict(self, pressure_kpa: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+        if self.coefficients is None or self.optimal_degree is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+        
+        p_norm = np.array(pressure_kpa, dtype=np.float64) / 1000.0
+        X = self._polynomial_features(p_norm, self.optimal_degree)
+        
+        result = X @ self.coefficients
+        if np.isscalar(pressure_kpa):
+            return float(max(result, 0.0))
+        return np.maximum(result, 0.0)
+
+    def _compute_delamination_risk(self, pressure_kpa: float, flow_rate_mls: float) -> float:
+        p_factor = min(max((pressure_kpa - 300.0) / (self.delamination_threshold_pressure_kpa - 300.0), 0.0), 1.0)
+        q_factor = min(max((flow_rate_mls - 200.0) / (self.max_flow_rate_mls - 200.0), 0.0), 1.0)
+        risk = (p_factor * 0.6 + q_factor * 0.4) * 100.0
+        return float(risk)
+
+    def optimize_injection_rate(
+        self,
+        pressure_range: Tuple[float, float] = (100.0, 500.0),
+        target_radius_mm: Optional[float] = None,
+        max_allowable_risk_pct: float = 30.0,
+    ) -> InjectionRateOptimizationResult:
+        if self.coefficients is None or self.optimal_degree is None:
+            raise ValueError("Model not fitted. Call fit() first.")
+        
+        test_pressures = np.linspace(pressure_range[0], pressure_range[1], 200)
+        predicted_flows = self.predict(test_pressures)
+        
+        curve_points = []
+        for p, q in zip(test_pressures, predicted_flows):
+            risk = self._compute_delamination_risk(float(p), float(q))
+            curve_points.append({
+                "pressure_kpa": round(float(p), 2),
+                "flow_rate_mls": round(float(q), 4),
+                "delamination_risk_pct": round(risk, 2),
+            })
+        
+        safe_mask = np.array([
+            self._compute_delamination_risk(float(p), float(q)) <= max_allowable_risk_pct
+            for p, q in zip(test_pressures, predicted_flows)
+        ])
+        
+        if not np.any(safe_mask):
+            safe_p_idx = np.argmin([
+                self._compute_delamination_risk(float(p), float(q))
+                for p, q in zip(test_pressures, predicted_flows)
+            ])
+            warning_msg = f"所有工况风险均超过{max_allowable_risk_pct}%，建议降低注浆压力"
+        else:
+            safe_pressures = test_pressures[safe_mask]
+            safe_flows = predicted_flows[safe_mask]
+            
+            if target_radius_mm is not None:
+                target_flow = target_radius_mm * 8.0
+                flow_diffs = np.abs(safe_flows - target_flow)
+                safe_p_idx = np.argmin(flow_diffs)
+                warning_msg = None
+            else:
+                safe_p_idx = np.argmax(safe_flows)
+                warning_msg = None
+            
+            test_pressures = safe_pressures
+            predicted_flows = safe_flows
+        
+        optimal_p = float(test_pressures[safe_p_idx])
+        optimal_q = float(predicted_flows[safe_p_idx])
+        risk_pct = self._compute_delamination_risk(optimal_p, optimal_q)
+        
+        max_safe_flow_idx = np.argmax(predicted_flows)
+        max_safe_flow = float(predicted_flows[max_safe_flow_idx])
+        
+        return InjectionRateOptimizationResult(
+            optimal_pressure_kpa=round(optimal_p, 2),
+            optimal_flow_rate_mls=round(optimal_q, 4),
+            polynomial_degree=int(self.optimal_degree),
+            polynomial_coefficients=[round(float(c), 6) for c in self.coefficients],
+            r_squared=round(self.r_squared, 4),
+            secondary_delamination_risk_pct=round(risk_pct, 2),
+            recommended_max_flow_mls=round(max_safe_flow, 4),
+            pressure_flow_curve=curve_points,
+            warning_message=warning_msg,
+        )

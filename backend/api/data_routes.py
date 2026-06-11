@@ -4,18 +4,24 @@ from sqlalchemy import select, and_, desc, func
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import logging
+import uuid
 
 from backend.models.database import (
     VibrationRawData, ThermalImage, ModalAnalysisResult,
-    DelaminationRegion, GroutingDiffusion,
+    DelaminationRegion, GroutingDiffusion, BondStrengthAssessment,
 )
 from backend.models import get_db
 from backend.schemas.models import (
     VibrationDataBatch, ThermalImageData, DataIngestResponse,
     ModalAnalysisResponse, DelaminationRegionResponse,
+    BondStrengthAssessmentRequest, BondStrengthAssessmentResponse,
 )
 from backend.services.data_processing import (
     VibrationProcessingService, ThermalProcessingService, AlertDetectionService,
+)
+from backend.algorithms.ssi_modal import (
+    BondStrengthAssessor,
+    assess_bond_strength_from_modal,
 )
 
 logger = logging.getLogger(__name__)
@@ -210,6 +216,216 @@ async def get_grouting_diffusion(
             "particle_pathlines": r.particle_pathlines,
             "viscosity_pa_s": float(r.viscosity_pa_s) if r.viscosity_pa_s else None,
             "porosity": float(r.porosity) if r.porosity else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/assess-bond-strength", response_model=BondStrengthAssessmentResponse)
+async def assess_bond_strength(
+    req: BondStrengthAssessmentRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        mode_shapes = None
+        if req.mode_shapes:
+            import numpy as np
+            mode_shapes = np.array(req.mode_shapes, dtype=np.float64)
+        
+        assessor = BondStrengthAssessor(
+            baseline_bond_strength_mpa=req.baseline_bond_strength_mpa,
+            damping_sensitivity_coefficient=req.damping_sensitivity_coefficient,
+        )
+        
+        result = assessor.assess_bond_strength(
+            surface_id=req.surface_id,
+            baseline_damping_ratios=req.baseline_damping_ratios,
+            current_damping_ratios=req.current_damping_ratios,
+            frequencies=req.frequencies,
+            mode_shapes=mode_shapes,
+        )
+        
+        db_record = BondStrengthAssessment(
+            time=datetime.utcnow(),
+            assessment_id=str(uuid.uuid4()),
+            surface_id=result["surface_id"],
+            baseline_damping_ratios=result["baseline_damping_ratios"],
+            current_damping_ratios=result["current_damping_ratios"],
+            frequencies_hz=result.get("frequencies_hz"),
+            energy_weights=result.get("energy_weights"),
+            per_mode_debonding_pct=result["per_mode_debonding_pct"],
+            per_mode_dissipation_energy=result["per_mode_dissipation_energy"],
+            bond_strength_degradation_pct=result["bond_strength_degradation_pct"],
+            remaining_bond_strength_mpa=result["remaining_bond_strength_mpa"],
+            baseline_bond_strength_mpa=result["baseline_bond_strength_mpa"],
+            critical_mode_index=result["critical_mode_index"],
+            assessment_confidence=result["assessment_confidence"],
+            risk_level=result["risk_level"],
+            recommendations=result["recommendations"],
+            damping_sensitivity_coefficient=req.damping_sensitivity_coefficient,
+        )
+        db.add(db_record)
+        await db.commit()
+        
+        return BondStrengthAssessmentResponse(
+            surface_id=result["surface_id"],
+            timestamp=result["timestamp"],
+            baseline_damping_ratios=result["baseline_damping_ratios"],
+            current_damping_ratios=result["current_damping_ratios"],
+            frequencies_hz=result.get("frequencies_hz"),
+            energy_weights=result.get("energy_weights"),
+            per_mode_debonding_pct=result["per_mode_debonding_pct"],
+            per_mode_dissipation_energy=result["per_mode_dissipation_energy"],
+            bond_strength_degradation_pct=result["bond_strength_degradation_pct"],
+            remaining_bond_strength_mpa=result["remaining_bond_strength_mpa"],
+            baseline_bond_strength_mpa=result["baseline_bond_strength_mpa"],
+            critical_mode_index=result["critical_mode_index"],
+            assessment_confidence=result["assessment_confidence"],
+            risk_level=result["risk_level"],
+            recommendations=result["recommendations"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"粘结强度评估失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/assess-bond-strength-from-modal/{surface_id}")
+async def assess_bond_strength_from_modal_data(
+    surface_id: str,
+    db: AsyncSession = Depends(get_db),
+    baseline_time: Optional[str] = None,
+):
+    try:
+        import numpy as np
+        
+        current_stmt = (
+            select(ModalAnalysisResult)
+            .where(ModalAnalysisResult.surface_id == surface_id)
+            .order_by(desc(ModalAnalysisResult.time))
+            .limit(1)
+        )
+        current_res = await db.execute(current_stmt)
+        current_modal = current_res.scalars().first()
+        
+        if not current_modal:
+            raise HTTPException(
+                status_code=404,
+                detail=f"墙面 {surface_id} 无当前模态分析数据"
+            )
+        
+        if baseline_time:
+            baseline_dt = datetime.fromisoformat(baseline_time.replace("Z", "+00:00"))
+            baseline_stmt = (
+                select(ModalAnalysisResult)
+                .where(
+                    and_(
+                        ModalAnalysisResult.surface_id == surface_id,
+                        ModalAnalysisResult.time <= baseline_dt,
+                    )
+                )
+                .order_by(desc(ModalAnalysisResult.time))
+                .limit(1)
+            )
+        else:
+            baseline_stmt = (
+                select(ModalAnalysisResult)
+                .where(
+                    and_(
+                        ModalAnalysisResult.surface_id == surface_id,
+                        ModalAnalysisResult.time < current_modal.time,
+                    )
+                )
+                .order_by(desc(ModalAnalysisResult.time))
+                .limit(1)
+            )
+        
+        baseline_res = await db.execute(baseline_stmt)
+        baseline_modal = baseline_res.scalars().first()
+        
+        if not baseline_modal:
+            raise HTTPException(
+                status_code=404,
+                detail=f"墙面 {surface_id} 无基线模态分析数据用于对比"
+            )
+        
+        result = assess_bond_strength_from_modal(
+            surface_id=surface_id,
+            baseline_modal={
+                "damping_ratios": list(baseline_modal.damping_ratios) if baseline_modal.damping_ratios else [],
+                "frequencies": list(baseline_modal.natural_frequencies) if baseline_modal.natural_frequencies else [],
+            },
+            current_modal={
+                "damping_ratios": list(current_modal.damping_ratios) if current_modal.damping_ratios else [],
+                "frequencies": list(current_modal.natural_frequencies) if current_modal.natural_frequencies else [],
+                "mode_shapes": current_modal.mode_shapes,
+            },
+        )
+        
+        db_record = BondStrengthAssessment(
+            time=datetime.utcnow(),
+            assessment_id=str(uuid.uuid4()),
+            surface_id=result["surface_id"],
+            baseline_damping_ratios=result["baseline_damping_ratios"],
+            current_damping_ratios=result["current_damping_ratios"],
+            frequencies_hz=result.get("frequencies_hz"),
+            energy_weights=result.get("energy_weights"),
+            per_mode_debonding_pct=result["per_mode_debonding_pct"],
+            per_mode_dissipation_energy=result["per_mode_dissipation_energy"],
+            bond_strength_degradation_pct=result["bond_strength_degradation_pct"],
+            remaining_bond_strength_mpa=result["remaining_bond_strength_mpa"],
+            baseline_bond_strength_mpa=result["baseline_bond_strength_mpa"],
+            critical_mode_index=result["critical_mode_index"],
+            assessment_confidence=result["assessment_confidence"],
+            risk_level=result["risk_level"],
+            recommendations=result["recommendations"],
+        )
+        db.add(db_record)
+        await db.commit()
+        
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"基于模态数据的粘结强度评估失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/bond-strength-history/{surface_id}")
+async def get_bond_strength_history(
+    surface_id: str,
+    days: int = Query(30, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = (
+        select(BondStrengthAssessment)
+        .where(
+            and_(
+                BondStrengthAssessment.surface_id == surface_id,
+                BondStrengthAssessment.time >= datetime.utcnow() - timedelta(days=days),
+            )
+        )
+        .order_by(desc(BondStrengthAssessment.time))
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+
+    return [
+        {
+            "time": r.time.isoformat() if r.time else None,
+            "assessment_id": r.assessment_id,
+            "surface_id": r.surface_id,
+            "bond_strength_degradation_pct": float(r.bond_strength_degradation_pct),
+            "remaining_bond_strength_mpa": float(r.remaining_bond_strength_mpa),
+            "baseline_bond_strength_mpa": float(r.baseline_bond_strength_mpa) if r.baseline_bond_strength_mpa else None,
+            "risk_level": r.risk_level,
+            "assessment_confidence": float(r.assessment_confidence) if r.assessment_confidence else None,
+            "critical_mode_index": r.critical_mode_index,
+            "per_mode_debonding_pct": list(r.per_mode_debonding_pct) if r.per_mode_debonding_pct else [],
+            "recommendations": r.recommendations,
         }
         for r in rows
     ]

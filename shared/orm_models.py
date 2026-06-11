@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, String, Integer, Float, DateTime, Boolean, Text,
-    ForeignKey, BigInteger, Numeric, ARRAY, LargeBinary,
+    ForeignKey, BigInteger, Numeric, ARRAY, LargeBinary, Index,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, DOUBLE_PRECISION
 from sqlalchemy.ext.declarative import declarative_base
@@ -180,3 +180,113 @@ class ReinforcementEffectiveness(Base):
     bonding_strength_mpa = Column(Numeric(10, 6))
     overall_score = Column(Numeric(5, 2))
     assessment_notes = Column(Text)
+
+
+class GroutingPressureFlowData(Base):
+    __tablename__ = "grouting_pressure_flow_data"
+    time = Column(TIMESTAMP(timezone=True), primary_key=True)
+    measurement_id = Column(String(40), primary_key=True)
+    task_id = Column(String(40), ForeignKey("grouting_tasks.task_id"))
+    surface_id = Column(String(30), ForeignKey("wall_surfaces.surface_id"))
+    pressure_kpa = Column(Numeric(10, 4), nullable=False)
+    flow_rate_mls = Column(Numeric(10, 4), nullable=False)
+    elapsed_seconds = Column(Numeric(12, 4))
+    temperature_c = Column(Numeric(6, 2))
+    is_reliable = Column(Boolean, default=True)
+    data_source = Column(String(20), default="measured")
+    polynomial_degree = Column(Integer)
+    r_squared = Column(Numeric(8, 6))
+    optimal_pressure_kpa = Column(Numeric(10, 4))
+    optimal_flow_rate_mls = Column(Numeric(10, 4))
+    secondary_delamination_risk_pct = Column(Numeric(8, 4))
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class BondStrengthAssessment(Base):
+    __tablename__ = "bond_strength_assessments"
+    time = Column(TIMESTAMP(timezone=True), primary_key=True)
+    assessment_id = Column(String(40), primary_key=True)
+    surface_id = Column(String(30), ForeignKey("wall_surfaces.surface_id"), nullable=False)
+    baseline_damping_ratios = Column(ARRAY(DOUBLE_PRECISION))
+    current_damping_ratios = Column(ARRAY(DOUBLE_PRECISION))
+    frequencies_hz = Column(ARRAY(DOUBLE_PRECISION))
+    energy_weights = Column(ARRAY(DOUBLE_PRECISION))
+    per_mode_debonding_pct = Column(ARRAY(DOUBLE_PRECISION))
+    per_mode_dissipation_energy = Column(ARRAY(DOUBLE_PRECISION))
+    bond_strength_degradation_pct = Column(Numeric(8, 4), nullable=False)
+    remaining_bond_strength_mpa = Column(Numeric(10, 6), nullable=False)
+    baseline_bond_strength_mpa = Column(Numeric(10, 6))
+    critical_mode_index = Column(Integer)
+    assessment_confidence = Column(Numeric(5, 4))
+    risk_level = Column(String(20), nullable=False)
+    recommendations = Column(JSONB)
+    damping_sensitivity_coefficient = Column(Numeric(8, 4))
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class DryingShrinkagePrediction(Base):
+    __tablename__ = "drying_shrinkage_predictions"
+    time = Column(TIMESTAMP(timezone=True), primary_key=True)
+    prediction_id = Column(String(40), primary_key=True)
+    task_id = Column(String(40), ForeignKey("grouting_tasks.task_id"))
+    surface_id = Column(String(30), ForeignKey("wall_surfaces.surface_id"))
+    formulation_id = Column(String(50), nullable=False)
+    formulation_name = Column(String(100))
+    ambient_temperature_c = Column(Numeric(6, 2), nullable=False)
+    ambient_humidity_pct = Column(Numeric(6, 2), nullable=False)
+    constraint_factor = Column(Numeric(5, 3))
+    wall_thickness_mm = Column(Numeric(8, 2))
+    final_shrinkage_strain = Column(Numeric(12, 8))
+    final_tensile_stress_mpa = Column(Numeric(10, 6))
+    crack_risk_index = Column(Numeric(8, 4))
+    predicted_crack_width_mm = Column(Numeric(8, 4))
+    crack_risk_level = Column(String(20), nullable=False)
+    critical_period_days = Column(Numeric(8, 2))
+    tensile_strength_mpa = Column(Numeric(10, 6))
+    elastic_modulus_mpa = Column(Numeric(10, 4))
+    shrinkage_time_curve = Column(JSONB)
+    recommendations = Column(JSONB)
+    aht_model_version = Column(String(20), default="AHT_v1")
+    prediction_horizon_days = Column(Numeric(8, 2))
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+
+class VisitorFlowStats(Base):
+    __tablename__ = "visitor_flow_stats"
+    date = Column(TIMESTAMP(timezone=True), primary_key=True)
+    cave_id = Column(String(20), ForeignKey("caves.cave_id"), primary_key=True)
+    daily_visitors = Column(Integer, nullable=False)
+    is_weekend = Column(Boolean, default=False)
+    is_peak_season = Column(Boolean, default=False)
+    is_holiday = Column(Boolean, default=False)
+    temperature_c = Column(Numeric(6, 2))
+    humidity_pct = Column(Numeric(6, 2))
+    special_event = Column(String(100))
+    notes = Column(Text)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_visitor_flow_cave_date", "cave_id", "date"),
+    )
+
+
+class CavePriorityRanking(Base):
+    __tablename__ = "cave_priority_rankings"
+    time = Column(TIMESTAMP(timezone=True), primary_key=True)
+    ranking_id = Column(String(40), primary_key=True)
+    cave_id = Column(String(20), ForeignKey("caves.cave_id"), nullable=False)
+    priority_rank = Column(Integer, nullable=False)
+    total_caves = Column(Integer)
+    urgency_score = Column(Numeric(8, 4))
+    cost_efficiency_score = Column(Numeric(8, 4))
+    cultural_impact_score = Column(Numeric(8, 4))
+    aggregated_score = Column(Numeric(8, 4), nullable=False)
+    weights_used = Column(JSONB)
+    method = Column(String(30), default="nsga_ii_multi_objective")
+    pareto_rank = Column(Integer)
+    crowding_distance = Column(Numeric(12, 6))
+    pareto_front_size = Column(Integer)
+    nsga_ii_summary = Column(JSONB)
+    input_metrics = Column(JSONB)
+    recommendations = Column(JSONB)
+    created_at = Column(TIMESTAMP(timezone=True), default=datetime.utcnow)

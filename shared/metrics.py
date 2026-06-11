@@ -106,6 +106,41 @@ API_REQUEST_DURATION = Histogram(
     registry=REGISTRY,
 )
 
+FEATURE_COMPUTATIONS = Counter(
+    "mogao_feature_computations_total",
+    "Total feature computations executed",
+    ["feature_type"],
+    registry=REGISTRY,
+)
+
+FEATURE_OPTIMAL_PRESSURE = Gauge(
+    "mogao_optimal_injection_pressure_kpa",
+    "Optimal injection pressure per task",
+    ["task_id"],
+    registry=REGISTRY,
+)
+
+FEATURE_BOND_STRENGTH = Gauge(
+    "mogao_remaining_bond_strength_mpa",
+    "Remaining bond strength per surface",
+    ["surface_id", "risk_level"],
+    registry=REGISTRY,
+)
+
+FEATURE_CRACK_RISK = Gauge(
+    "mogao_crack_risk_index",
+    "Predicted crack risk index per prediction",
+    ["formulation_id", "risk_level"],
+    registry=REGISTRY,
+)
+
+FEATURE_PRIORITY_RANK = Gauge(
+    "mogao_priority_rank_score",
+    "Priority ranking score per cave",
+    ["cave_id", "rank"],
+    registry=REGISTRY,
+)
+
 
 def metrics_endpoint():
     data = generate_latest(REGISTRY)

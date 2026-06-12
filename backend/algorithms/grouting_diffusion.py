@@ -413,11 +413,13 @@ class PressureFlowPolynomialRegressor:
         use_cross_validation: bool = True,
         delamination_threshold_pressure_kpa: float = 450.0,
         max_flow_rate_mls: float = 500.0,
+        ridge_alpha: float = 1e-3,
     ):
         self.max_degree = max_degree
         self.use_cross_validation = use_cross_validation
         self.delamination_threshold_pressure_kpa = delamination_threshold_pressure_kpa
         self.max_flow_rate_mls = max_flow_rate_mls
+        self.ridge_alpha = ridge_alpha
         self.optimal_degree = None
         self.coefficients = None
         self.r_squared = 0.0
@@ -425,8 +427,35 @@ class PressureFlowPolynomialRegressor:
     def _polynomial_features(self, x: np.ndarray, degree: int) -> np.ndarray:
         return np.vander(x, degree + 1, increasing=True)
 
-    def _fit_ols(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
-        return np.linalg.lstsq(X, y, rcond=None)[0]
+    def _standardize_features(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        mu = np.mean(X, axis=0)
+        sigma = np.std(X, axis=0)
+        sigma[sigma < 1e-12] = 1.0
+        X_std = (X - mu) / sigma
+        X_std[:, 0] = X[:, 0]
+        mu[0] = 0.0
+        sigma[0] = 1.0
+        return X_std, mu, sigma
+
+    def _fit_ridge(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        X_std, mu, sigma = self._standardize_features(X)
+        n_features = X_std.shape[1]
+        A = X_std.T @ X_std
+        diag = np.eye(n_features)
+        diag[0, 0] = 0.0
+        A += self.ridge_alpha * diag
+        b = X_std.T @ y
+        try:
+            beta_std = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            beta_std = np.linalg.lstsq(A, b, rcond=None)[0]
+        beta = beta_std / sigma
+        beta[0] = beta[0] - np.sum(mu * beta_std / sigma)
+        return beta, mu, sigma
 
     def _compute_r_squared(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         ss_res = np.sum((y_true - y_pred) ** 2)
@@ -444,23 +473,23 @@ class PressureFlowPolynomialRegressor:
         indices = np.arange(n_samples)
         np.random.shuffle(indices)
         fold_size = n_samples // n_folds
-        
+
         scores = []
         for fold in range(n_folds):
             val_start = fold * fold_size
             val_end = val_start + fold_size if fold < n_folds - 1 else n_samples
-            
+
             val_indices = indices[val_start:val_end]
             train_indices = np.concatenate([indices[:val_start], indices[val_end:]])
-            
+
             X_train, X_val = X[train_indices], X[val_indices]
             y_train, y_val = y[train_indices], y[val_indices]
-            
-            coeffs = self._fit_ols(X_train, y_train)
+
+            coeffs, _, _ = self._fit_ridge(X_train, y_train)
             y_pred = X_val @ coeffs
-            
+
             scores.append(self._compute_r_squared(y_val, y_pred))
-        
+
         return float(np.mean(scores))
 
     def fit(
@@ -470,38 +499,37 @@ class PressureFlowPolynomialRegressor:
         reliable_points = [p for p in data_points if p.is_reliable]
         if len(reliable_points) < 10:
             reliable_points = data_points
-        
+
         pressures = np.array([p.pressure_kpa for p in reliable_points], dtype=np.float64)
         flows = np.array([p.flow_rate_mls for p in reliable_points], dtype=np.float64)
-        
+
         press_norm = pressures / 1000.0
-        
+
         best_score = -np.inf
         best_degree = 2
-        best_coeffs = None
-        
+
         for degree in range(2, self.max_degree + 1):
             X = self._polynomial_features(press_norm, degree)
-            
+
             if self.use_cross_validation and len(reliable_points) >= 15:
                 score = self._cross_validation_score(X, flows, degree)
             else:
-                coeffs = self._fit_ols(X, flows)
+                coeffs, _, _ = self._fit_ridge(X, flows)
                 y_pred = X @ coeffs
                 score = self._compute_r_squared(flows, y_pred)
-            
+
             if score > best_score:
                 best_score = score
                 best_degree = degree
-        
+
         X_best = self._polynomial_features(press_norm, best_degree)
-        best_coeffs = self._fit_ols(X_best, flows)
+        best_coeffs, _, _ = self._fit_ridge(X_best, flows)
         y_pred = X_best @ best_coeffs
         self.r_squared = self._compute_r_squared(flows, y_pred)
-        
+
         self.optimal_degree = best_degree
         self.coefficients = best_coeffs
-        
+
         return self
 
     def predict(self, pressure_kpa: Union[float, np.ndarray]) -> Union[float, np.ndarray]:

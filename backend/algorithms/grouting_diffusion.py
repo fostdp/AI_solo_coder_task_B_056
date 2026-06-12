@@ -363,28 +363,38 @@ def generate_simulated_pressure_flow_data(
     pressure_range_kpa: Tuple[float, float] = (50.0, 600.0),
     viscosity_pa_s: float = 0.25,
     noise_std_pct: float = 0.08,
+    max_flow_rate_mls: float = 500.0,
 ) -> List[PressureFlowDataPoint]:
     points = []
     pressures = np.linspace(pressure_range_kpa[0], pressure_range_kpa[1], n_points)
-    
+    p_min, p_max = pressure_range_kpa
+    q_at_max = max_flow_rate_mls * 0.95
+
     for i, p in enumerate(pressures):
         t_sec = i * 30.0 + np.random.uniform(0, 10.0)
-        
-        theoretical_flow = (1e-12 * p * 1000.0 * 2.0 * np.pi * 0.05 * 0.05) / (viscosity_pa_s * 0.05) * 1e6
-        
+
+        p_norm = (p - p_min) / max(p_max - p_min, 1.0)
+        theoretical_flow = q_at_max * (
+            0.15 * p_norm
+            + 0.55 * (p_norm ** 1.5)
+            + 0.30 * (p_norm ** 2.5)
+        )
+
         if p > 400:
-            theoretical_flow *= (1.0 + 0.0008 * (p - 400))
-        
-        noise = np.random.normal(0, noise_std_pct * theoretical_flow)
-        measured_flow = max(theoretical_flow + noise, 1.0)
-        
+            superlinear = 1.0 + 0.0025 * (p - 400)
+            theoretical_flow *= min(superlinear, 1.5)
+
+        theoretical_flow = min(theoretical_flow, max_flow_rate_mls)
+        noise = np.random.normal(0, noise_std_pct * max(theoretical_flow, 10.0))
+        measured_flow = max(theoretical_flow + noise, 5.0)
+
         is_reliable = True
-        if np.random.rand() < 0.1:
-            measured_flow *= np.random.uniform(0.6, 0.8)
+        if np.random.rand() < 0.08:
+            measured_flow *= np.random.uniform(0.55, 0.80)
             is_reliable = False
-        
+
         temp_c = 18.0 + np.random.normal(0, 2.0)
-        
+
         points.append(PressureFlowDataPoint(
             pressure_kpa=float(p),
             flow_rate_mls=float(measured_flow),
@@ -392,7 +402,7 @@ def generate_simulated_pressure_flow_data(
             temperature_c=float(temp_c),
             is_reliable=is_reliable,
         ))
-    
+
     return points
 
 
@@ -497,13 +507,14 @@ class PressureFlowPolynomialRegressor:
     def predict(self, pressure_kpa: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
         if self.coefficients is None or self.optimal_degree is None:
             raise ValueError("Model not fitted. Call fit() first.")
-        
-        p_norm = np.array(pressure_kpa, dtype=np.float64) / 1000.0
+
+        scalar_input = np.isscalar(pressure_kpa)
+        p_norm = np.atleast_1d(np.array(pressure_kpa, dtype=np.float64) / 1000.0)
         X = self._polynomial_features(p_norm, self.optimal_degree)
-        
+
         result = X @ self.coefficients
-        if np.isscalar(pressure_kpa):
-            return float(max(result, 0.0))
+        if scalar_input:
+            return float(max(result[0], 0.0))
         return np.maximum(result, 0.0)
 
     def _compute_delamination_risk(self, pressure_kpa: float, flow_rate_mls: float) -> float:

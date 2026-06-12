@@ -98,16 +98,16 @@ class AHTDryingShrinkageModel:
         self.initial_curing_days = initial_curing_days
         self.prediction_horizon = prediction_horizon_days
 
-    def set_formulation(self, formulation: GroutFormulation):
-        if not isinstance(formulation, GroutFormulation):
-            raise ValueError("formulation 必须是 GroutFormulation 类型")
-        self.formulation = formulation
-        
         self.AHT_beta = 0.15
         self.AHT_gamma = 0.6
         self.humidity_sensitivity = 0.8
         self.temperature_activation_energy = 35000.0
         self.R_gas_constant = 8.314
+
+    def set_formulation(self, formulation: GroutFormulation):
+        if not isinstance(formulation, GroutFormulation):
+            raise ValueError("formulation 必须是 GroutFormulation 类型")
+        self.formulation = formulation
 
     def _arrhenius_temperature_factor(
         self,

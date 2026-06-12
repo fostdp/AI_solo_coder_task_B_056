@@ -49,16 +49,106 @@ class NSGAIISolver:
         eta_c: float = 20.0,
         eta_m: float = 20.0,
         random_seed: Optional[int] = 42,
+        use_adaptive_mutation: bool = True,
+        mutation_prob_min: float = 0.02,
+        mutation_prob_max: float = 0.30,
+        eta_m_min: float = 10.0,
+        eta_m_max: float = 40.0,
+        diversity_window: int = 5,
     ):
         self.pop_size = population_size
         self.max_gen = max_generations
         self.p_c = crossover_prob
+        self.p_m_init = mutation_prob
         self.p_m = mutation_prob
         self.eta_c = eta_c
+        self.eta_m_init = eta_m
         self.eta_m = eta_m
-        
+        self.use_adaptive_mutation = use_adaptive_mutation
+        self.p_m_min = mutation_prob_min
+        self.p_m_max = mutation_prob_max
+        self.eta_m_min = eta_m_min
+        self.eta_m_max = eta_m_max
+        self.diversity_window = diversity_window
+
+        self._hv_history = []
+        self._pareto_size_history = []
+
         if random_seed is not None:
             np.random.seed(random_seed)
+
+    def _population_spread_metric(self, objectives: np.ndarray) -> float:
+        n_obj = objectives.shape[1]
+        norm_obj = self._normalize_objectives(objectives)
+        spreads = []
+        for k in range(n_obj):
+            col = norm_obj[:, k]
+            spreads.append(float(np.std(col)))
+        return float(np.mean(spreads)) if len(spreads) > 0 else 0.0
+
+    def _compute_spacing(self, pareto_objectives: np.ndarray) -> float:
+        n = pareto_objectives.shape[0]
+        if n < 2:
+            return 0.0
+        norm_obj = self._normalize_objectives(pareto_objectives)
+        distances = []
+        for i in range(n):
+            min_dist = np.inf
+            for j in range(n):
+                if i == j:
+                    continue
+                d = np.linalg.norm(norm_obj[i] - norm_obj[j])
+                if d < min_dist:
+                    min_dist = d
+            if min_dist < np.inf:
+                distances.append(min_dist)
+        if len(distances) < 2:
+            return 0.0
+        return float(np.std(distances))
+
+    def _adaptive_mutation_parameters(
+        self,
+        generation: int,
+        pareto_objectives: np.ndarray,
+    ) -> Tuple[float, float]:
+        if not self.use_adaptive_mutation:
+            return self.p_m_init, self.eta_m_init
+
+        gen_progress = generation / max(self.max_gen - 1, 1)
+
+        diversity = self._population_spread_metric(pareto_objectives)
+        diversity = min(max(diversity, 0.0), 1.0)
+
+        self._pareto_size_history.append(len(pareto_objectives))
+        if len(self._pareto_size_history) > self.diversity_window:
+            self._pareto_size_history = self._pareto_size_history[-self.diversity_window:]
+        if len(self._pareto_size_history) >= 2:
+            recent_growth = (
+                self._pareto_size_history[-1] - self._pareto_size_history[0]
+            ) / max(self._pareto_size_history[0], 1)
+        else:
+            recent_growth = 0.0
+
+        stagnation_factor = 1.0
+        if len(self._pareto_size_history) >= self.diversity_window and recent_growth < 0.02:
+            stagnation_factor = 1.5
+
+        diversity_factor = 1.0 - 0.6 * diversity
+        stage_factor = 1.0 - 0.7 * gen_progress
+
+        p_m_relative = min(max(
+            stage_factor * diversity_factor * stagnation_factor,
+            0.15,
+        ), 1.5)
+
+        current_p_m = self.p_m_init * p_m_relative
+        current_p_m = min(max(current_p_m, self.p_m_min), self.p_m_max)
+
+        eta_m_relative = 1.0 + 0.8 * gen_progress - 0.4 * diversity_factor
+        current_eta_m = self.eta_m_init * eta_m_relative
+        current_eta_m = min(max(current_eta_m, self.eta_m_min), self.eta_m_max)
+
+        return float(current_p_m), float(current_eta_m)
 
     def _normalize_objectives(
         self,
@@ -249,37 +339,41 @@ class NSGAIISolver:
         individual: np.ndarray,
         lower_bounds: np.ndarray,
         upper_bounds: np.ndarray,
+        p_m: Optional[float] = None,
+        eta_m: Optional[float] = None,
     ) -> np.ndarray:
         n_var = len(individual)
         mutant = individual.copy()
-        
+        cur_pm = self.p_m if p_m is None else p_m
+        cur_etam = self.eta_m if eta_m is None else eta_m
+
         for i in range(n_var):
-            if np.random.rand() > self.p_m:
+            if np.random.rand() > cur_pm:
                 continue
-            
+
             y = mutant[i]
             y_low = lower_bounds[i]
             y_high = upper_bounds[i]
-            
+
             if y_high > y_low:
                 delta1 = (y - y_low) / (y_high - y_low)
                 delta2 = (y_high - y) / (y_high - y_low)
-                
+
                 rand = np.random.rand()
-                mut_pow = 1.0 / (self.eta_m + 1.0)
-                
+                mut_pow = 1.0 / (cur_etam + 1.0)
+
                 if rand <= 0.5:
                     xy = 1.0 - delta1
-                    val = 2.0 * rand + (1.0 - 2.0 * rand) * (xy ** (self.eta_m + 1.0))
+                    val = 2.0 * rand + (1.0 - 2.0 * rand) * (xy ** (cur_etam + 1.0))
                     delta_q = val ** mut_pow - 1.0
                 else:
                     xy = 1.0 - delta2
-                    val = 2.0 * (1.0 - rand) + 2.0 * (rand - 0.5) * (xy ** (self.eta_m + 1.0))
+                    val = 2.0 * (1.0 - rand) + 2.0 * (rand - 0.5) * (xy ** (cur_etam + 1.0))
                     delta_q = 1.0 - val ** mut_pow
-                
+
                 mutant[i] = y + delta_q * (y_high - y_low)
                 mutant[i] = np.clip(mutant[i], y_low, y_high)
-        
+
         return mutant
 
     def solve(
@@ -308,39 +402,48 @@ class NSGAIISolver:
         
         for gen in range(self.max_gen):
             fronts, ranks = self._fast_non_dominated_sort(norm_objectives, maximize)
-            
+
+            current_pareto = pop_objectives[fronts[0]] if len(fronts) > 0 else pop_objectives
+            self.p_m, self.eta_m = self._adaptive_mutation_parameters(gen, current_pareto)
+
             crowding = np.zeros(self.pop_size)
             for front in fronts:
                 cd = self._crowding_distance(norm_objectives, front)
                 for idx, f_idx in enumerate(front):
                     crowding[f_idx] = cd[idx]
-            
+
             parents = self._tournament_selection(population, ranks, crowding)
-            
+
             offspring = np.zeros_like(population)
             for i in range(0, self.pop_size, 2):
                 p1_idx = i
                 p2_idx = i + 1 if i + 1 < self.pop_size else 0
-                
+
                 child1, child2 = self._sbx_crossover(
                     parents[p1_idx], parents[p2_idx],
                     lower_bounds, upper_bounds,
                 )
-                child1 = self._polynomial_mutation(child1, lower_bounds, upper_bounds)
-                child2 = self._polynomial_mutation(child2, lower_bounds, upper_bounds)
-                
+                child1 = self._polynomial_mutation(
+                    child1, lower_bounds, upper_bounds,
+                    p_m=self.p_m, eta_m=self.eta_m,
+                )
+                child2 = self._polynomial_mutation(
+                    child2, lower_bounds, upper_bounds,
+                    p_m=self.p_m, eta_m=self.eta_m,
+                )
+
                 offspring[i] = child1
                 if i + 1 < self.pop_size:
                     offspring[i + 1] = child2
-            
+
             combined_pop = np.vstack([population, offspring])
             combined_obj = np.vstack([pop_objectives, np.array([
                 objective_function(ind) for ind in offspring
             ])])
             combined_norm = self._normalize_objectives(combined_obj)
-            
+
             fronts, ranks = self._fast_non_dominated_sort(combined_norm, maximize)
-            
+
             new_population = []
             new_objectives = []
             for front in fronts:
@@ -356,7 +459,7 @@ class NSGAIISolver:
                         new_population.extend(selected)
                         new_objectives.extend(selected)
                     break
-            
+
             population = combined_pop[new_population]
             pop_objectives = combined_obj[new_population]
             norm_objectives = self._normalize_objectives(pop_objectives)
@@ -366,6 +469,9 @@ class NSGAIISolver:
         )
         pareto_front = pop_objectives[final_fronts[0]] if len(final_fronts) > 0 else pop_objectives
         pareto_solutions = population[final_fronts[0]] if len(final_fronts) > 0 else population
+
+        final_spacing = self._compute_spacing(pareto_front)
+        final_diversity = self._population_spread_metric(pop_objectives)
 
         return {
             "population": population,
@@ -378,6 +484,11 @@ class NSGAIISolver:
             "population_size": self.pop_size,
             "n_objectives": n_objectives,
             "pareto_front_size": len(pareto_front),
+            "adaptive_mutation_used": self.use_adaptive_mutation,
+            "final_mutation_prob": round(float(self.p_m), 4),
+            "final_mutation_eta_m": round(float(self.eta_m), 4),
+            "pareto_spacing": round(float(final_spacing), 6),
+            "population_diversity": round(float(final_diversity), 6),
         }
 
 

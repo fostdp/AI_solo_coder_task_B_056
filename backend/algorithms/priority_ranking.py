@@ -1,7 +1,7 @@
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 @dataclass
@@ -360,8 +360,25 @@ class NSGAIISolver:
             population = combined_pop[new_population]
             pop_objectives = combined_obj[new_population]
             norm_objectives = self._normalize_objectives(pop_objectives)
-        
-        return population, pop_objectives
+
+        final_fronts, final_ranks = self._fast_non_dominated_sort(
+            self._normalize_objectives(pop_objectives), maximize
+        )
+        pareto_front = pop_objectives[final_fronts[0]] if len(final_fronts) > 0 else pop_objectives
+        pareto_solutions = population[final_fronts[0]] if len(final_fronts) > 0 else population
+
+        return {
+            "population": population,
+            "objectives": pop_objectives,
+            "pareto_front": pareto_front,
+            "pareto_solutions": pareto_solutions,
+            "fronts": final_fronts,
+            "ranks": final_ranks,
+            "generations": self.max_gen,
+            "population_size": self.pop_size,
+            "n_objectives": n_objectives,
+            "pareto_front_size": len(pareto_front),
+        }
 
 
 class CaveProtectionPriorityRanking:
@@ -527,7 +544,7 @@ class CaveProtectionPriorityRanking:
             mutation_prob=0.15,
         )
         
-        final_pop, final_obj = solver.solve(
+        solve_result = solver.solve(
             n_variables=3,
             n_objectives=3,
             lower_bounds=lower_bounds,
@@ -535,15 +552,19 @@ class CaveProtectionPriorityRanking:
             objective_function=obj_func,
             maximize=[True, True, True],
         )
-        
+
+        final_pop = solve_result["population"]
+        final_obj = solve_result["objectives"]
+        fronts = solve_result["fronts"]
+        ranks = solve_result["ranks"]
+
         norm_obj = solver._normalize_objectives(final_obj)
-        fronts, ranks = solver._fast_non_dominated_sort(norm_obj, [True, True, True])
         crowding = np.zeros(len(final_obj))
         for front in fronts:
             cd = solver._crowding_distance(norm_obj, front)
             for idx, f_idx in enumerate(front):
                 crowding[f_idx] = cd[idx]
-        
+
         best_idx = 0
         best_agg = -np.inf
         for i in range(len(final_pop)):
@@ -552,41 +573,42 @@ class CaveProtectionPriorityRanking:
             if agg > best_agg:
                 best_agg = agg
                 best_idx = i
-        
+
         optimal_weights = np.abs(final_pop[best_idx]) / np.sum(np.abs(final_pop[best_idx]))
         self.weights = {
             "urgency": float(optimal_weights[0]),
             "cost_efficiency": float(optimal_weights[1]),
             "cultural_impact": float(optimal_weights[2]),
         }
-        
+
         results = []
         for cave in caves:
             urgency = self.compute_urgency_score(cave)
             efficiency = self.compute_cost_efficiency(cave)
             impact = self.compute_cultural_impact(cave)
-            
+
             aggregated_score = (
                 urgency * self.weights["urgency"]
                 + efficiency * self.weights["cost_efficiency"]
                 + impact * self.weights["cultural_impact"]
             )
-            
+
             results.append({
                 "cave_id": cave.cave_id,
                 "cave_name": cave.cave_name,
                 "urgency_score": round(urgency, 4),
                 "cost_efficiency_score": round(efficiency, 4),
                 "cultural_impact_score": round(impact, 4),
-                "aggregated_score": round(aggregated_score, 4),
+                "aggregated_score": round(aggregated_score * 100, 4),
                 "weights_used": {k: round(v, 4) for k, v in self.weights.items()},
                 "method": "nsga_ii_multi_objective",
-                "pareto_rank": int(ranks[best_idx]),
-                "crowding_distance": round(float(crowding[best_idx]), 4) if not np.isinf(crowding[best_idx]) else None,
+                "pareto_rank": int(ranks[best_idx]) if best_idx < len(ranks) else 0,
+                "crowding_distance": round(float(crowding[best_idx]), 4) if best_idx < len(crowding) and not np.isinf(crowding[best_idx]) else None,
+                "pareto_front_size": solve_result["pareto_front_size"],
                 "nsga_ii_summary": {
                     "population_size": 40,
                     "generations": 60,
-                    "pareto_front_size": len(fronts[0]),
+                    "pareto_front_size": solve_result["pareto_front_size"],
                     "convergence_indicator": round(float(np.mean(final_obj[:, 0])), 4),
                 },
                 "detail_metrics": {
@@ -619,7 +641,7 @@ def generate_simulated_visitor_flow(
     visitor_counts = []
     
     for d in range(days):
-        date = datetime(2025, 1, 1) + datetime.timedelta(days=d)
+        date = datetime(2025, 1, 1) + timedelta(days=d)
         is_weekend = date.weekday() >= 5
         is_peak_season = 5 <= date.month <= 10
         is_holiday = (date.month == 10 and 1 <= date.day <= 7) or (date.month == 5 and 1 <= date.day <= 5)

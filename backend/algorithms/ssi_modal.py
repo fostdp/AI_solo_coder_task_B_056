@@ -330,11 +330,31 @@ class BondStrengthAssessor:
         damping_sensitivity_coefficient: float = 2.5,
         minimum_damping_change: float = 0.002,
         reference_damping_ratio: float = 0.012,
+        reference_temperature_c: float = 20.0,
+        temperature_activation_factor: float = 0.025,
     ):
         self.baseline_bond_strength_mpa = baseline_bond_strength_mpa
         self.alpha = damping_sensitivity_coefficient
         self.min_delta_damp = minimum_damping_change
         self.reference_damping = reference_damping_ratio
+        self.T_ref_c = reference_temperature_c
+        self.temp_activation = temperature_activation_factor
+
+    def _temperature_correction_factor(self, ambient_temperature_c: float) -> float:
+        delta_T = ambient_temperature_c - self.T_ref_c
+        WLF_factor = 1.0 + self.temp_activation * abs(delta_T)
+        if delta_T > 0:
+            return WLF_factor
+        else:
+            return 1.0 / WLF_factor
+
+    def _correct_damping_for_temperature(
+        self,
+        damping_ratio: float,
+        ambient_temperature_c: float,
+    ) -> float:
+        factor = self._temperature_correction_factor(ambient_temperature_c)
+        return float(damping_ratio / factor)
 
     def _damping_energy_dissipation(
         self,
@@ -391,45 +411,63 @@ class BondStrengthAssessor:
         frequencies: Optional[List[float]] = None,
         mode_shapes: Optional[np.ndarray] = None,
         timestamp: Optional[str] = None,
+        ambient_temperature_c: Optional[float] = None,
     ) -> Dict:
         baseline = np.array(baseline_damping_ratios, dtype=np.float64)
         current = np.array(current_damping_ratios, dtype=np.float64)
-        
+
         n_modes = min(len(baseline), len(current))
         baseline = baseline[:n_modes]
         current = current[:n_modes]
-        
+
+        if ambient_temperature_c is not None:
+            T_corr = float(ambient_temperature_c)
+            temp_factor = self._temperature_correction_factor(T_corr)
+            current_corrected = np.array([
+                self._correct_damping_for_temperature(float(c), T_corr)
+                for c in current
+            ])
+            baseline_corrected = np.array([
+                self._correct_damping_for_temperature(float(b), self.T_ref_c)
+                for b in baseline
+            ])
+        else:
+            T_corr = self.T_ref_c
+            temp_factor = 1.0
+            current_corrected = current
+            baseline_corrected = baseline
+
         if frequencies is not None:
             freqs = np.array(frequencies[:n_modes], dtype=np.float64)
         else:
             freqs = np.array([5.0 * (i + 1) for i in range(n_modes)], dtype=np.float64)
-        
+
         if mode_shapes is not None and mode_shapes.shape[1] >= n_modes:
             weights = self._modal_strain_energy_distribution(mode_shapes[:, :n_modes], freqs)
         else:
             weights = np.exp(-freqs / 20.0)
             weights = weights / np.sum(weights)
-        
+
         per_mode_debonding = []
         per_mode_energy = []
         for m in range(n_modes):
-            delta_xi = current[m] - baseline[m]
+            delta_xi = current_corrected[m] - baseline_corrected[m]
             debonding = self._interface_debonding_model(delta_xi, freqs[m])
-            energy = self._damping_energy_dissipation(current[m], freqs[m])
-            
+            energy = self._damping_energy_dissipation(current_corrected[m], freqs[m])
+
             per_mode_debonding.append(float(debonding))
             per_mode_energy.append(float(energy))
-        
+
         overall_degradation_pct = float(np.sum(weights * np.array(per_mode_debonding)))
-        
+
         remaining_strength = self.baseline_bond_strength_mpa * (1.0 - overall_degradation_pct / 100.0)
         remaining_strength = max(remaining_strength, 0.0)
-        
+
         critical_mode_idx = int(np.argmax(per_mode_debonding)) if n_modes > 0 else None
-        
+
         reliability_samples = n_modes * 10
         assessment_confidence = min(0.95, 0.5 + 0.01 * reliability_samples)
-        
+
         if overall_degradation_pct >= 40:
             risk_level = "极高"
         elif overall_degradation_pct >= 25:
@@ -440,7 +478,7 @@ class BondStrengthAssessor:
             risk_level = "低"
         else:
             risk_level = "无"
-        
+
         recommendations = []
         if risk_level in ["高", "极高"]:
             recommendations.append("立即开展空鼓区域检测，明确剥离范围和深度")
@@ -455,19 +493,24 @@ class BondStrengthAssessor:
             recommendations.append("检查传感器工作状态，排除测量误差影响")
         else:
             recommendations.append("地仗层粘结状态良好，按常规周期监测即可")
-        
+
         if critical_mode_idx is not None and per_mode_debonding[critical_mode_idx] > 20:
             recommendations.append(f"第{critical_mode_idx + 1}阶模态({freqs[critical_mode_idx]:.1f}Hz)阻尼异常升高，建议重点排查对应振动波腹区域")
-        
+
+        if ambient_temperature_c is not None and abs(ambient_temperature_c - self.T_ref_c) > 10:
+            direction = "偏高" if ambient_temperature_c > self.T_ref_c else "偏低"
+            recommendations.append(f"当前环境温度{ambient_temperature_c:.1f}°C较参考温度{self.T_ref_c:.1f}°C{direction}，已进行阻尼温度修正，修正系数={temp_factor:.3f}")
+
         if timestamp is None:
             from datetime import datetime
             timestamp = datetime.utcnow().isoformat() + "Z"
-        
+
         return {
             "surface_id": surface_id,
             "timestamp": timestamp,
-            "baseline_damping_ratios": [round(float(x), 6) for x in baseline],
-            "current_damping_ratios": [round(float(x), 6) for x in current],
+            "baseline_damping_ratios": [round(float(x), 6) for x in baseline_corrected],
+            "current_damping_ratios": [round(float(x), 6) for x in current_corrected],
+            "raw_current_damping_ratios": [round(float(x), 6) for x in current],
             "frequencies_hz": [round(float(x), 4) for x in freqs],
             "energy_weights": [round(float(x), 6) for x in weights],
             "per_mode_debonding_pct": [round(float(x), 4) for x in per_mode_debonding],
@@ -478,6 +521,8 @@ class BondStrengthAssessor:
             "critical_mode_index": critical_mode_idx,
             "assessment_confidence": round(assessment_confidence, 4),
             "risk_level": risk_level,
+            "ambient_temperature_c": round(T_corr, 2) if ambient_temperature_c is not None else None,
+            "temperature_correction_factor": round(temp_factor, 4) if ambient_temperature_c is not None else None,
             "recommendations": recommendations,
         }
 
